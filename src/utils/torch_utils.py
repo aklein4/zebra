@@ -1,0 +1,416 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import utils.constants as constants
+if constants.XLA_AVAILABLE:
+    from torch_xla.experimental.scan import scan
+    from torch_xla.distributed.spmd.xla_sharding import XLAPatchedLinear
+
+"""
+A collection of PyTorch utility functions that might be useful.
+"""
+
+
+def scale_gradient(
+    x: torch.Tensor,
+    scale: torch.Tensor | float | dict
+) -> torch.Tensor:
+    """
+    Scales the gradient flowing through x by the given scale factor.
+
+    If scale is a dict, it should have a "value" key containing the actual scale factor once the backward pass is executed.
+    However, it can be empty during the forward pass, which allows you to set the scale factor after the forward pass is complete.
+    
+    Args:
+        x (torch.Tensor): Input tensor.
+        scale (torch.Tensor | float | dict): Scale factor for the gradient.
+    Returns:
+        torch.Tensor: Tensor with the same data as x, but with the gradient scaled by scale during backpropagation.
+    """
+    return _ScaleGradient.apply(x, scale)
+
+class _ScaleGradient(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, x, scale):
+        if isinstance(scale, torch.Tensor):
+            ctx.save_for_backward(scale)
+        else:
+            ctx.scale = scale
+        return x.clone()
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+
+        if hasattr(ctx, "scale"):
+            scale = ctx.scale
+        else:
+            scale, = ctx.saved_tensors
+
+        if isinstance(scale, dict):
+            scale = scale["value"]
+
+        if isinstance(scale, torch.Tensor):
+            scale = scale.to(grad_output.dtype)
+
+        return grad_output * scale, None
+
+
+
+def attach_gradient(
+    real: torch.Tensor,
+    ghost: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Attaches the gradient of `ghost` to `real` during backpropagation, so that
+    `ghost` will also receive the same gradient as `real` during backpropagation.
+
+    Args:
+        real (torch.Tensor): The tensor whose value is used in the forward pass.
+        ghost (torch.Tensor): The tensor which also recieves the gradient during backpropagation.
+    Returns:
+        torch.Tensor: Tensor with the same data as real, but with the gradient of ghost attached during backpropagation.
+    """
+    return _AttachGradient.apply(real, ghost)
+
+class _AttachGradient(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, real, ghost):
+        return real.clone()
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, grad_output
+
+
+def print_gradient(
+    x: torch.Tensor,
+    name: str | None = None,
+) -> torch.Tensor:
+    """
+    Print the gradient flowing through x during backpropagation.
+    
+    If name is provided, it will be printed before the gradient for easier identification.
+    
+    Args:
+        x (torch.Tensor): Input tensor.
+        name (str | None): Optional name to identify the gradient.
+    Returns:
+        torch.Tensor: Tensor with the same data as x, but with the gradient printed during backpropagation.
+    """
+    return _PrintGradient.apply(x, name)
+
+class _PrintGradient(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, x, name):
+        ctx.name = name
+        return x
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+
+        if ctx.name is not None:
+            print(f"Gradient of {ctx.name}:", flush=True)
+        else:
+            print("Gradient:", flush=True)
+        print(grad_output, flush=True)
+        
+        return grad_output, None
+
+
+def transform_gradient(
+    x: torch.Tensor,
+    fn: callable,
+    fn_kwargs: dict={},
+) -> torch.Tensor:
+    """
+    Applies a transformation function to the gradient flowing through x.
+
+    fn should have the signature: fn(x, grad_output, **fn_kwargs) -> transformed_grad_output
+    
+    Args:
+        x (torch.Tensor): Input tensor.
+        fn (callable): Function to transform the gradient.
+        fn_kwargs (dict): Additional keyword arguments for the function.
+    Returns:
+        torch.Tensor: Tensor with the same data as x, but with the gradient transformed by fn during backpropagation.
+    """
+    return _TransformGradient.apply(x, fn, fn_kwargs)
+
+class _TransformGradient(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, x, fn, fn_kwargs):
+        ctx.save_for_backward(x)
+        ctx.fn = fn
+        ctx.fn_kwargs = fn_kwargs
+        return x.clone()
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        x = ctx.saved_tensors[0]
+
+        grad_output = ctx.fn(
+            x, grad_output, **ctx.fn_kwargs
+        )
+
+        return grad_output, None, None
+
+
+def unsqueeze_to_batch(
+    x: torch.Tensor,
+    target: torch.Tensor
+) -> torch.Tensor:
+    """
+    Add leading dimensions to x (out-of-place) until it has the same number of dimensions as target.
+
+    Args:
+        x (torch.Tensor): Input tensor to be unsqueezed.
+        target (torch.Tensor): Target tensor whose number of dimensions we want to match.
+    Returns:
+        torch.Tensor: Tensor with the same data as x, but with leading dimensions added.
+    """
+
+    while x.dim() < target.dim():
+        x = x[None]
+
+    return x
+
+
+def expand_to_batch(
+    x: torch.Tensor,
+    target: torch.Tensor
+) -> torch.Tensor:
+    """
+    Add leading dimensions to x (out-of-place) until it has the same number of dimensions as target.
+    Then expand those leading dimensions to match the corresponding dimensions of target.
+
+    Existing dimensions of x are not changed.
+
+    Args:
+        x (torch.Tensor): Input tensor to be expanded.
+        target (torch.Tensor): Target tensor whose number of dimensions and leading dimension sizes we want to match.
+    Returns:
+        torch.Tensor: Tensor with the same data as x, but with leading dimensions added and expanded.
+    """
+    og_shape = x.shape
+
+    num_unsqueeze = 0
+    while x.dim() < target.dim():
+        x = x[None]
+        num_unsqueeze += 1
+
+    x = x.expand(
+        *([target.shape[i] for i in range(num_unsqueeze)] + list(og_shape))
+    )
+
+    return x
+
+
+def unsqueeze_to_channel(
+    x: torch.Tensor,
+    target: torch.Tensor
+) -> torch.Tensor:
+    """
+    Add trailing dimensions to x (out-of-place) until it has the same number of dimensions as target.
+
+    Args:
+        x (torch.Tensor): Input tensor to be unsqueezed.
+        target (torch.Tensor): Target tensor whose number of dimensions we want to match.
+    Returns:
+        torch.Tensor: Tensor with the same data as x, but with trailing dimensions added.
+    """
+
+    while x.dim() < target.dim():
+        x = x[..., None]
+
+    return x
+
+
+def expand_to_channel(
+    x: torch.Tensor,
+    target: torch.Tensor
+) -> torch.Tensor:
+    """
+    Add trailing dimensions to x (out-of-place) until it has the same number of dimensions as target.
+    Then expand those trailing dimensions to match the corresponding dimensions of target.
+
+    Existing dimensions of x are not changed.
+
+    Args:
+        x (torch.Tensor): Input tensor to be expanded.
+        target (torch.Tensor): Target tensor whose number of dimensions and trailing dimension sizes we want to match.
+    Returns:
+        torch.Tensor: Tensor with the same data as x, but with trailing dimensions added and expanded.
+    """
+    og_shape = x.shape
+
+    num_unsqueeze = 0
+    while x.dim() < target.dim():
+        x = x[..., None]
+        num_unsqueeze += 1
+
+    x = x.expand(
+        *(list(og_shape) + [target.shape[i] for i in range(num_unsqueeze)])
+    )
+
+    return x
+
+
+def safe_copy_state(
+    src: nn.Module,
+    dst: nn.Module,
+    strict: bool = True,
+) -> None:
+    """
+    Copy the state dict from src to dst, safely cloning and detaching every tensor.
+    
+    dst is modified in-place, and nothing is returned.
+
+    Args:
+        src (nn.Module): Source module to copy state from.
+        dst (nn.Module): Destination module to copy state to.
+        strict (bool): Whether to strictly enforce that the keys in src and dst match.
+    """
+
+    state = {
+        k: v.clone().detach() for k, v in src.state_dict().items()
+    }
+
+    dst.load_state_dict(state, strict=strict)
+
+
+def safe_finite(x: torch.Tensor, safe=False) -> torch.Tensor:
+    # `torch.nan_to_num` has historically been spotty on some backends/dtypes (e.g. XLA+bfloat16).
+    # `where(isfinite)` is the most portable way to guarantee non-finite values become zeros.
+    if safe:
+        return torch.where(torch.isfinite(x), x, torch.zeros_like(x))
+    else:
+        return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def newton_schulz(G, steps=5, eps=1e-7):
+    """
+    Perform spectral whitening on G using Newton-Schulz iteration.
+
+    See: https://kellerjordan.github.io/posts/muon/
+
+    Args:
+        G (torch.Tensor): Input tensor of shape [n, m].
+        steps (int): Number of iterations to perform.
+        eps (float): Small constant to prevent division by zero.
+    Returns:
+        torch.Tensor: Spectrally whitened tensor of shape [n, m].
+    """
+    assert G.ndim >= 2 
+    
+    X = G
+    if G.size(-2) > G.size(-1):
+        X = X.transpose(-2, -1)
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
+
+    # Perform the NS iterations
+    if constants.XLA_AVAILABLE and False:
+        ts = torch.arange(steps, device=X.device)
+        X, _ = scan(
+            _newton_schulz_inner, X, ts,
+            # is_fn_pure=True
+        )
+    else:
+        for t in range(steps):
+            X, _ = _newton_schulz_inner(X, t)
+        
+    if G.size(-2) > G.size(-1):
+        X = X.transpose(-2, -1)
+
+    return X
+
+
+def _newton_schulz_inner(X, t):
+    a, b, c = (3.4445, -4.7750,  2.0315)
+
+    A = X @ X.transpose(-2, -1)
+    B = b * A + c * A @ A
+    X = a * X + B @ X
+
+    return X, X
+
+
+_cuda_newton_schulz = None
+def cuda_newton_schulz():
+    global _cuda_newton_schulz
+    if _cuda_newton_schulz is None:
+        _cuda_newton_schulz = torch.compile(
+            newton_schulz,
+            mode="reduce-overhead",
+            fullgraph=True,
+        ) 
+    return _cuda_newton_schulz
+
+
+def select_newton_schulz():
+    if constants.XLA_AVAILABLE or not torch.cuda.is_available():
+        return newton_schulz
+    else:
+        return cuda_newton_schulz()
+
+
+def shift(
+    x: torch.Tensor,
+    n: int,
+    dim: int,
+    direction: str,
+    narrow: bool,
+):
+
+    zero_shape = list(x.shape)
+    zero_shape[dim] = n
+    z = torch.zeros(*zero_shape, device=x.device, dtype=x.dtype)
+
+    if direction == 'right':
+        if narrow:
+            x = torch.narrow(x, dim, 0, x.shape[dim] - n)
+        
+        l = [z, x]
+
+    elif direction == 'left':
+        if narrow:
+            x = torch.narrow(x, dim, n, x.shape[dim] - n)
+        
+        l = [x, z]
+
+    else:
+        raise ValueError(f"Invalid direction: {direction}")
+    
+    return torch.cat(l, dim=dim)
+
+
+def gaussian_init(module: nn.Module):
+
+    if isinstance(module, nn.Linear):
+        module.weight.data.normal_(mean=0.0, std=1/module.in_features**0.5)
+        if module.bias is not None:
+            module.bias.data.zero_()
+
+    elif isinstance(module, nn.Embedding):
+        module.weight.data.normal_(mean=0.0, std=1)
+
+
+def safe_repeat(
+    x: torch.Tensor, n_repeats: int, dim: int=0
+) -> torch.Tensor:
+    return torch.cat(
+        [x] * n_repeats,
+        dim=dim
+    )
+
+
+def fixed_linear(x, weight, bias=None):
+    if constants.XLA_AVAILABLE:
+        return XLAPatchedLinear.apply(x, weight, bias)
+    return F.linear(x, weight, bias)
